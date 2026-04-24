@@ -18,27 +18,20 @@ def get_route():
         polygon = gdf.geometry.iloc[0]
         boundary_line = polygon.boundary
         
-        # 2. FETCH THE GRAPH (Buffered by ~100m to catch the outer roads)
+        # 2. FETCH THE GRAPH
         buffered_poly = polygon.buffer(0.001) 
-        
-        # Filter: ONLY quiet roads (No highways, no commercial main strips)
         cf = '["highway"~"residential|living_street|unclassified|tertiary"]'
-        
-        # Download map
         G = ox.graph_from_polygon(buffered_poly, network_type='walk', custom_filter=cf, simplify=True)
         
-        # 3. CLEAN THE GRAPH (Fixes the 4 lines and Spiderwebs bugs)
+        # 3. CLEAN THE GRAPH 
         G_un = ox.utils_graph.get_undirected(G)
-        
-        # Strip out floating disconnected streets
         largest_cc = max(nx.connected_components(G_un), key=len)
         G_clean = G_un.subgraph(largest_cc).copy()
 
-        # 4. BUILD THE MASTER ROUTING GRAPH (The 1-side vs 2-side logic)
+        # 4. BUILD THE MASTER ROUTING GRAPH
         G_route = nx.MultiGraph()
         
         for u, v, key, data in G_clean.edges(keys=True, data=True):
-            # Extract geometry
             if 'geometry' in data:
                 geom = data['geometry']
             else:
@@ -46,29 +39,26 @@ def get_route():
                                    (G_clean.nodes[v]['x'], G_clean.nodes[v]['y'])])
                 data['geometry'] = geom
 
-            # Check if this road is on the border (within ~40 meters of the boundary line)
             is_boundary = geom.distance(boundary_line) < 0.0004 
             
-            # Add nodes
             G_route.add_node(u, x=G_clean.nodes[u]['x'], y=G_clean.nodes[u]['y'])
             G_route.add_node(v, x=G_clean.nodes[v]['x'], y=G_clean.nodes[v]['y'])
             
-            # The Magic: 1 edge for boundaries, 2 edges for internal residential
             if is_boundary:
-                G_route.add_edge(u, v, **data) # Walk once
+                G_route.add_edge(u, v, **data) 
             else:
-                G_route.add_edge(u, v, **data) # Walk down
-                G_route.add_edge(u, v, **data) # Walk back
+                G_route.add_edge(u, v, **data) 
+                G_route.add_edge(u, v, **data) 
                 
         # 5. EULERIZE
         G_euler = nx.eulerize(G_route)
         circuit = list(nx.eulerian_circuit(G_euler))
         
-        # 6. DRAW THE PATH WITH SMART VECTOR SHIFTING & PULLBACK
-        route_coords = []
+        # 6. CONTINUOUS MITER SHIFT (Fixes the intersection rectangles)
+        raw_continuous_coords = []
         
+        # Step A: Flatten the entire walk into one continuous list of coordinates
         for u, v in circuit:
-            # Get the physical road geometry
             edge_data = G_clean.get_edge_data(u, v)
             if not edge_data:
                 edge_data = G_clean.get_edge_data(v, u)
@@ -76,60 +66,73 @@ def get_route():
             
             coords = list(geom.coords)
             
-            # Ensure the line coordinates flow in the direction we are actually walking (u to v)
             start_point = coords[0]
             node_u_coords = (G_clean.nodes[u]['x'], G_clean.nodes[u]['y'])
             
-            # If the geometry was drawn backwards in OpenStreetMap, flip it
             dist_to_start = (start_point[0] - node_u_coords[0])**2 + (start_point[1] - node_u_coords[1])**2
             dist_to_end = (coords[-1][0] - node_u_coords[0])**2 + (coords[-1][1] - node_u_coords[1])**2
+            
             if dist_to_end < dist_to_start:
                 coords.reverse()
 
-            offset_coords = []
-            num_points = len(coords)
+            if not raw_continuous_coords:
+                raw_continuous_coords.extend(coords)
+            else:
+                # Skip the first point to prevent duplicates exactly at the intersection joint
+                raw_continuous_coords.extend(coords[1:])
+
+        # Step B: Apply a continuous geometric right-hand offset
+        route_coords = []
+        offset_dist = 0.00003  # ~3 meter sidewalk shift
+        num_points = len(raw_continuous_coords)
+
+        for i in range(num_points):
+            curr = raw_continuous_coords[i]
             
-            for i in range(num_points - 1):
-                x1, y1 = coords[i]
-                x2, y2 = coords[i+1]
+            if i == 0:
+                nxt = raw_continuous_coords[i+1]
+                dx, dy = nxt[0] - curr[0], nxt[1] - curr[1]
+            elif i == num_points - 1:
+                prev = raw_continuous_coords[i-1]
+                dx, dy = curr[0] - prev[0], curr[1] - prev[1]
+            else:
+                prev = raw_continuous_coords[i-1]
+                nxt = raw_continuous_coords[i+1]
                 
-                # Calculate vector direction
-                dx = x2 - x1
-                dy = y2 - y1
-                length = math.hypot(dx, dy)
+                dx1, dy1 = curr[0] - prev[0], curr[1] - prev[1]
+                dx2, dy2 = nxt[0] - curr[0], nxt[1] - curr[1]
                 
-                if length == 0:
-                    continue
+                L1 = math.hypot(dx1, dy1) or 1
+                L2 = math.hypot(dx2, dy2) or 1
+                
+                ux1, uy1 = dx1/L1, dy1/L1
+                ux2, uy2 = dx2/L2, dy2/L2
+                
+                nx1, ny1 = uy1, -ux1
+                nx2, ny2 = uy2, -ux2
+                
+                nx_avg = nx1 + nx2
+                ny_avg = ny1 + ny2
+                L_avg = math.hypot(nx_avg, ny_avg)
+                
+                if L_avg < 0.1: # 180 degree U-Turn detected, prevent math explosion
+                    ox, oy = nx1 * offset_dist, ny1 * offset_dist
+                else:
+                    nx_avg /= L_avg
+                    ny_avg /= L_avg
+                    dot = max(-1.0, min(1.0, ux1*ux2 + uy1*uy2))
+                    cos_half_theta = math.sqrt((1.0 + dot) / 2.0)
+                    # Cap the spike factor so super sharp corners don't fly off the screen
+                    factor = offset_dist / max(cos_half_theta, 0.2)
+                    ox, oy = nx_avg * factor, ny_avg * factor
                     
-                # Calculate the 90-degree Right normal vector
-                nx_vec = dy / length
-                ny_vec = -dx / length
+                route_coords.append({"lat": curr[1] + oy, "lng": curr[0] + ox})
+                continue
                 
-                # Shift by ~2.5 meters (tighter to road so it doesn't clip)
-                offset = 0.000025 
-                
-                new_x1 = x1 + (nx_vec * offset)
-                new_y1 = y1 + (ny_vec * offset)
-                new_x2 = x2 + (nx_vec * offset)
-                new_y2 = y2 + (ny_vec * offset)
-                
-                # THE FIX: Pullback the lines from the intersection by ~5 meters
-                pullback = 0.00005
-                
-                if i == 0 and length > pullback * 2:
-                    new_x1 += (dx / length) * pullback
-                    new_y1 += (dy / length) * pullback
-                    
-                if i == num_points - 2 and length > pullback * 2:
-                    new_x2 -= (dx / length) * pullback
-                    new_y2 -= (dy / length) * pullback
-                
-                if i == 0:
-                    offset_coords.append({'lat': new_y1, 'lng': new_x1})
-                    
-                offset_coords.append({'lat': new_y2, 'lng': new_x2})
-                
-            route_coords.extend(offset_coords)
+            # Normal calculation for the very first and last points of the entire route
+            L = math.hypot(dx, dy) or 1
+            nx, ny = dy/L, -dx/L
+            route_coords.append({"lat": curr[1] + ny * offset_dist, "lng": curr[0] + nx * offset_dist})
 
         return jsonify(route_coords)
 
