@@ -7,6 +7,34 @@ import math
 
 app = Flask(__name__)
 
+from flask import Response
+
+@app.route('/download_kml')
+def download_kml():
+    # Call your existing logic to get the route_coords
+    # For this example, assume route_coords is available
+    
+    kml_content = """<?xml version="1.0" encoding="UTF-8"?>
+    <kml xmlns="http://www.opengis.net/kml/2.2">
+      <Document>
+        <name>Edwardstown Walking Route</name>
+        <Placemark>
+          <LineString>
+            <coordinates>"""
+    
+    # KML uses Longitude, Latitude order
+    for pt in route_coords:
+        kml_content += f"{pt['lng']},{pt['lat']},0 "
+        
+    kml_content += """</coordinates>
+          </LineString>
+        </Placemark>
+      </Document>
+    </kml>"""
+    
+    return Response(kml_content, mimetype='application/vnd.google-earth.kml+xml',
+                    headers={"Content-disposition": "attachment; filename=route.kml"})
+
 @app.route('/get_route', methods=['GET'])
 def get_route():
     suburb = request.args.get('suburb', 'Edwardstown')
