@@ -1,4 +1,5 @@
 flask
-osmnx
+osmnx==1.9.3
 networkx
 gunicorn
+shapely
