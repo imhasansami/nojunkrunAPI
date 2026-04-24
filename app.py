@@ -27,7 +27,7 @@ def get_route():
         # Download map
         G = ox.graph_from_polygon(buffered_poly, network_type='walk', custom_filter=cf, simplify=True)
         
-        # 3. CLEAN THE GRAPH (Fixes the "4 lines" and "Spiderwebs" bugs)
+        # 3. CLEAN THE GRAPH (Fixes the 4 lines and Spiderwebs bugs)
         G_un = ox.utils_graph.get_undirected(G)
         
         # Strip out floating disconnected streets
@@ -64,7 +64,7 @@ def get_route():
         G_euler = nx.eulerize(G_route)
         circuit = list(nx.eulerian_circuit(G_euler))
         
-        # 6. DRAW THE PATH WITH SMART VECTOR SHIFTING
+        # 6. DRAW THE PATH WITH SMART VECTOR SHIFTING & PULLBACK
         route_coords = []
         
         for u, v in circuit:
@@ -86,9 +86,10 @@ def get_route():
             if dist_to_end < dist_to_start:
                 coords.reverse()
 
-            # Dynamic Right-Hand Shift (creates the perfect "sidewalk" double lines)
             offset_coords = []
-            for i in range(len(coords) - 1):
+            num_points = len(coords)
+            
+            for i in range(num_points - 1):
                 x1, y1 = coords[i]
                 x2, y2 = coords[i+1]
                 
@@ -104,18 +105,29 @@ def get_route():
                 nx_vec = dy / length
                 ny_vec = -dx / length
                 
-                # Shift by ~3 meters (0.00003 degrees)
-                offset = 0.00003
+                # Shift by ~2.5 meters (tighter to road so it doesn't clip)
+                offset = 0.000025 
                 
                 new_x1 = x1 + (nx_vec * offset)
                 new_y1 = y1 + (ny_vec * offset)
-                
-                if i == 0:
-                    offset_coords.append({"lat": new_y1, "lng": new_x1})
-                    
                 new_x2 = x2 + (nx_vec * offset)
                 new_y2 = y2 + (ny_vec * offset)
-                offset_coords.append({"lat": new_y2, "lng": new_x2})
+                
+                # THE FIX: Pullback the lines from the intersection by ~5 meters
+                pullback = 0.00005
+                
+                if i == 0 and length > pullback * 2:
+                    new_x1 += (dx / length) * pullback
+                    new_y1 += (dy / length) * pullback
+                    
+                if i == num_points - 2 and length > pullback * 2:
+                    new_x2 -= (dx / length) * pullback
+                    new_y2 -= (dy / length) * pullback
+                
+                if i == 0:
+                    offset_coords.append({'lat': new_y1, 'lng': new_x1})
+                    
+                offset_coords.append({'lat': new_y2, 'lng': new_x2})
                 
             route_coords.extend(offset_coords)
 
@@ -123,7 +135,7 @@ def get_route():
 
     except Exception as e:
         print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
