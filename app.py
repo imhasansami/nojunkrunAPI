@@ -3,6 +3,7 @@ import networkx as nx
 from flask import Flask, request, jsonify, Response
 from shapely.geometry import LineString
 import traceback
+import math
 
 app = Flask(__name__)
 
@@ -20,7 +21,7 @@ def get_route():
         polygon = gdf.geometry.iloc[0]
         boundary_line = polygon.boundary
         
-        # 2. FETCH GRAPH (Strictly no commercial)
+        # 2. FETCH GRAPH (Strictly no commercial strips)
         buffered_poly = polygon.buffer(0.001) 
         cf = '["highway"~"residential|living_street|unclassified|tertiary"]'
         G = ox.graph_from_polygon(buffered_poly, network_type='walk', custom_filter=cf, simplify=True)
@@ -30,7 +31,7 @@ def get_route():
         largest_cc = max(nx.connected_components(G_un), key=len)
         G_clean = G_un.subgraph(largest_cc).copy()
 
-        # 4. MASTER ROUTING GRAPH
+        # 4. MASTER ROUTING GRAPH (The Double-Sided Logic)
         G_route = nx.MultiGraph()
         
         for u, v, key, data in G_clean.edges(keys=True, data=True):
@@ -46,6 +47,7 @@ def get_route():
             G_route.add_node(u, x=G_clean.nodes[u]['x'], y=G_clean.nodes[u]['y'])
             G_route.add_node(v, x=G_clean.nodes[v]['x'], y=G_clean.nodes[v]['y'])
             
+            # Walk boundary once, walk internal streets twice
             if is_boundary:
                 G_route.add_edge(u, v, **data) 
             else:
@@ -61,9 +63,9 @@ def get_route():
         else:
             circuit = list(nx.eulerian_circuit(G_euler))
         
-        # 6. PURE CONTIGUOUS PATHING (The Worm)
-        # No offset math. Just raw, connected centerlines.
+        # 6. CONTINUOUS OFFSET WORM (Restores Double-Sided Paths cleanly)
         route_coords = []
+        OFFSET = 0.000025  # ~2.5 meter shift to the right shoulder
         
         for u, v in circuit:
             edge_data = G_clean.get_edge_data(u, v)
@@ -73,17 +75,37 @@ def get_route():
             
             coords = list(geom.coords)
             
+            # Ensure the coordinates flow exactly in the direction the worm is walking
             node_u_coords = (G_clean.nodes[u]['x'], G_clean.nodes[u]['y'])
             start_point = coords[0]
             dist_to_start = (start_point[0] - node_u_coords[0])**2 + (start_point[1] - node_u_coords[1])**2
             
-            # Ensure the geometry flows exactly in the direction the worm is walking
             if dist_to_start > 1e-10:
                 coords.reverse()
 
-            # Append pure coordinates to build a single unbroken chain
-            for x, y in coords:
-                route_coords.append({"lat": y, "lng": x})
+            # Apply a simple right-hand shift to every segment
+            for i in range(len(coords) - 1):
+                x1, y1 = coords[i]
+                x2, y2 = coords[i+1]
+                
+                dx = x2 - x1
+                dy = y2 - y1
+                length = math.hypot(dx, dy)
+                
+                if length == 0:
+                    continue
+                    
+                nx_vec = dy / length
+                ny_vec = -dx / length
+                
+                off_x = nx_vec * OFFSET
+                off_y = ny_vec * OFFSET
+                
+                # Appending them sequentially into one master list guarantees 
+                # Android draws one connected continuous path.
+                if i == 0:
+                    route_coords.append({"lat": y1 + off_y, "lng": x1 + off_x})
+                route_coords.append({"lat": y2 + off_y, "lng": x2 + off_x})
 
         # 7. EXPORT LOGIC
         format_type = request.args.get('format', 'json')
