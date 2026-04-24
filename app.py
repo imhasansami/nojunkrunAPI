@@ -78,7 +78,6 @@ def get_route():
             if not raw_continuous_coords:
                 raw_continuous_coords.extend(coords)
             else:
-                # Skip the first point to prevent duplicates exactly at the intersection joint
                 raw_continuous_coords.extend(coords[1:])
 
         # Step B: Apply a continuous geometric right-hand offset
@@ -116,23 +115,24 @@ def get_route():
                 L_avg = math.hypot(nx_avg, ny_avg)
                 
                 if L_avg < 0.1: # 180 degree U-Turn detected, prevent math explosion
-                    ox, oy = nx1 * offset_dist, ny1 * offset_dist
+                    # RENAMED from ox, oy to off_x, off_y
+                    off_x, off_y = nx1 * offset_dist, ny1 * offset_dist
                 else:
                     nx_avg /= L_avg
                     ny_avg /= L_avg
                     dot = max(-1.0, min(1.0, ux1*ux2 + uy1*uy2))
                     cos_half_theta = math.sqrt((1.0 + dot) / 2.0)
-                    # Cap the spike factor so super sharp corners don't fly off the screen
                     factor = offset_dist / max(cos_half_theta, 0.2)
-                    ox, oy = nx_avg * factor, ny_avg * factor
+                    # RENAMED from ox, oy to off_x, off_y
+                    off_x, off_y = nx_avg * factor, ny_avg * factor
                     
-                route_coords.append({"lat": curr[1] + oy, "lng": curr[0] + ox})
+                route_coords.append({"lat": curr[1] + off_y, "lng": curr[0] + off_x})
                 continue
                 
             # Normal calculation for the very first and last points of the entire route
             L = math.hypot(dx, dy) or 1
-            nx, ny = dy/L, -dx/L
-            route_coords.append({"lat": curr[1] + ny * offset_dist, "lng": curr[0] + nx * offset_dist})
+            nx_val, ny_val = dy/L, -dx/L
+            route_coords.append({"lat": curr[1] + ny_val * offset_dist, "lng": curr[0] + nx_val * offset_dist})
 
         return jsonify(route_coords)
 
