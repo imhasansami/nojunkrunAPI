@@ -1,4 +1,4 @@
 flask
-osmnx>=1.9.0
-networkx>=3.0
+osmnx
+networkx
 gunicorn
