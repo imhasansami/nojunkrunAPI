@@ -21,7 +21,7 @@ def get_route():
         polygon = gdf.geometry.iloc[0]
         boundary_line = polygon.boundary
         
-        # 2. FETCH GRAPH (Strictly no commercial strips)
+        # 2. FETCH GRAPH
         buffered_poly = polygon.buffer(0.001) 
         cf = '["highway"~"residential|living_street|unclassified|tertiary"]'
         G = ox.graph_from_polygon(buffered_poly, network_type='walk', custom_filter=cf, simplify=True)
@@ -31,7 +31,7 @@ def get_route():
         largest_cc = max(nx.connected_components(G_un), key=len)
         G_clean = G_un.subgraph(largest_cc).copy()
 
-        # 4. MASTER ROUTING GRAPH (The Double-Sided Logic)
+        # 4. MASTER ROUTING GRAPH (Double-sided Logic)
         G_route = nx.MultiGraph()
         
         for u, v, key, data in G_clean.edges(keys=True, data=True):
@@ -47,7 +47,6 @@ def get_route():
             G_route.add_node(u, x=G_clean.nodes[u]['x'], y=G_clean.nodes[u]['y'])
             G_route.add_node(v, x=G_clean.nodes[v]['x'], y=G_clean.nodes[v]['y'])
             
-            # Walk boundary once, walk internal streets twice
             if is_boundary:
                 G_route.add_edge(u, v, **data) 
             else:
@@ -63,10 +62,8 @@ def get_route():
         else:
             circuit = list(nx.eulerian_circuit(G_euler))
         
-        # 6. CONTINUOUS OFFSET WORM (Restores Double-Sided Paths cleanly)
-        route_coords = []
-        OFFSET = 0.000025  # ~2.5 meter shift to the right shoulder
-        
+        # 6. FLATTEN TO TRUE CONTINUOUS ARRAY
+        raw_coords = []
         for u, v in circuit:
             edge_data = G_clean.get_edge_data(u, v)
             if not edge_data:
@@ -75,7 +72,7 @@ def get_route():
             
             coords = list(geom.coords)
             
-            # Ensure the coordinates flow exactly in the direction the worm is walking
+            # Ensure proper flow direction
             node_u_coords = (G_clean.nodes[u]['x'], G_clean.nodes[u]['y'])
             start_point = coords[0]
             dist_to_start = (start_point[0] - node_u_coords[0])**2 + (start_point[1] - node_u_coords[1])**2
@@ -83,31 +80,70 @@ def get_route():
             if dist_to_start > 1e-10:
                 coords.reverse()
 
-            # Apply a simple right-hand shift to every segment
-            for i in range(len(coords) - 1):
-                x1, y1 = coords[i]
-                x2, y2 = coords[i+1]
+            if not raw_coords:
+                raw_coords.extend(coords)
+            else:
+                # Drop the duplicate intersection node to fuse the lines perfectly
+                raw_coords.extend(coords[1:])
                 
-                dx = x2 - x1
-                dy = y2 - y1
-                length = math.hypot(dx, dy)
+        # 7. CONTINUOUS MITER SPLINE & U-TURN FIX
+        route_coords = []
+        OFFSET = 0.000025  # ~2.5 meter right shift
+        n = len(raw_coords)
+        
+        for i in range(n):
+            if i == 0:
+                p1, p2 = raw_coords[0], raw_coords[1]
+                dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+                L = math.hypot(dx, dy) or 1
+                route_coords.append({"lat": p1[1] + (-dx/L)*OFFSET, "lng": p1[0] + (dy/L)*OFFSET})
+            elif i == n - 1:
+                p1, p2 = raw_coords[n-2], raw_coords[n-1]
+                dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+                L = math.hypot(dx, dy) or 1
+                route_coords.append({"lat": p2[1] + (-dx/L)*OFFSET, "lng": p2[0] + (dy/L)*OFFSET})
+            else:
+                prev = raw_coords[i-1]
+                curr = raw_coords[i]
+                nxt = raw_coords[i+1]
                 
-                if length == 0:
+                dx1, dy1 = curr[0] - prev[0], curr[1] - prev[1]
+                dx2, dy2 = nxt[0] - curr[0], nxt[1] - curr[1]
+                
+                L1, L2 = math.hypot(dx1, dy1), math.hypot(dx2, dy2)
+                
+                if L1 < 1e-8 or L2 < 1e-8:
                     continue
                     
-                nx_vec = dy / length
-                ny_vec = -dx / length
+                # Right-hand normals
+                nx1, ny1 = dy1/L1, -dx1/L1
+                nx2, ny2 = dy2/L2, -dx2/L2
                 
-                off_x = nx_vec * OFFSET
-                off_y = ny_vec * OFFSET
+                dot = (dx1/L1)*(dx2/L2) + (dy1/L1)*(dy2/L2)
                 
-                # Appending them sequentially into one master list guarantees 
-                # Android draws one connected continuous path.
-                if i == 0:
-                    route_coords.append({"lat": y1 + off_y, "lng": x1 + off_x})
-                route_coords.append({"lat": y2 + off_y, "lng": x2 + off_x})
+                # U-TURN DETECTOR: If turning sharper than 143 degrees
+                if dot < -0.8:
+                    # Do not miter. Cross the street like a crosswalk.
+                    route_coords.append({"lat": curr[1] + ny1*OFFSET, "lng": curr[0] + nx1*OFFSET})
+                    route_coords.append({"lat": curr[1] + ny2*OFFSET, "lng": curr[0] + nx2*OFFSET})
+                else:
+                    # Normal smooth corner
+                    nx_avg, ny_avg = nx1 + nx2, ny1 + ny2
+                    L_avg = math.hypot(nx_avg, ny_avg)
+                    
+                    if L_avg > 1e-8:
+                        nx_avg /= L_avg
+                        ny_avg /= L_avg
+                        
+                        clamped_dot = max(-0.999, dot)
+                        cos_half_theta = math.sqrt((1.0 + clamped_dot) / 2.0)
+                        factor = OFFSET / max(cos_half_theta, 0.3) # Caps the spike length
+                        
+                        route_coords.append({"lat": curr[1] + ny_avg*factor, "lng": curr[0] + nx_avg*factor})
+                    else:
+                        route_coords.append({"lat": curr[1] + ny1*OFFSET, "lng": curr[0] + nx1*OFFSET})
 
-        # 7. EXPORT LOGIC
+        # 8. EXPORT LOGIC
         format_type = request.args.get('format', 'json')
         if format_type == 'kml':
             kml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
