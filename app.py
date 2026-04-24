@@ -4,39 +4,45 @@ from flask import Flask, request, jsonify
 from shapely.geometry import LineString, Point
 import traceback
 import math
+from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 
-from flask import Response
-
 @app.route('/download_kml')
 def download_kml():
-    # Call your existing logic to get the route_coords
-    # For this example, assume route_coords is available
-    
-    kml_content = """<?xml version="1.0" encoding="UTF-8"?>
-    <kml xmlns="http://www.opengis.net/kml/2.2">
-      <Document>
-        <name>Edwardstown Walking Route</name>
-        <Placemark>
-          <LineString>
-            <coordinates>"""
-    
-    # KML uses Longitude, Latitude order
-    for pt in route_coords:
-        kml_content += f"{pt['lng']},{pt['lat']},0 "
+   # Check if the app wants to draw lines (json) or download a file (kml)
+        format_type = request.args.get('format', 'json')
         
-    kml_content += """</coordinates>
-          </LineString>
-        </Placemark>
-      </Document>
-    </kml>"""
-    
-   return Response(
-    kml_content,
-    mimetype='application/vnd.google-earth.kml+xml',
-    headers={"Content-disposition": "attachment; filename=route.kml"}
-)
+        if format_type == 'kml':
+            kml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+            <kml xmlns="http://www.opengis.net/kml/2.2">
+              <Document>
+                <name>{suburb} Walking Route</name>
+                <Placemark>
+                  <LineString>
+                    <coordinates>"""
+            
+            # KML requires longitude first, then latitude
+            for pt in route_coords:
+                kml_content += f"{pt['lng']},{pt['lat']},0 "
+                
+            kml_content += """</coordinates>
+                  </LineString>
+                </Placemark>
+              </Document>
+            </kml>"""
+            
+            # Clean up the filename so it doesn't break browser downloads
+            safe_filename = suburb.replace(' ', '_') + "_route.kml"
+            
+            return Response(
+                kml_content, 
+                mimetype='application/vnd.google-earth.kml+xml',
+                headers={"Content-disposition": f"attachment; filename={safe_filename}"}
+            )
+        else:
+            # Default behavior for the Android app
+            return jsonify(route_coords)
 
 @app.route('/get_route', methods=['GET'])
 def get_route():
