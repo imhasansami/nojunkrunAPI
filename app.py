@@ -32,8 +32,11 @@ def download_kml():
       </Document>
     </kml>"""
     
-    return Response(kml_content, mimetype='application/vnd.google-earth.kml+xml',
-                    headers={"Content-disposition": "attachment; filename=route.kml"})
+   return Response(
+    kml_content,
+    mimetype='application/vnd.google-earth.kml+xml',
+    headers={"Content-disposition": "attachment; filename=route.kml"}
+)
 
 @app.route('/get_route', methods=['GET'])
 def get_route():
