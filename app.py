@@ -10,6 +10,11 @@ app = Flask(__name__)
 @app.route('/get_route', methods=['GET'])
 def get_route():
     suburb = request.args.get('suburb', 'Edwardstown')
+    
+    # NEW: Accept start coordinates from Android
+    start_lat = request.args.get('lat')
+    start_lng = request.args.get('lng')
+    
     query = f"{suburb}, South Australia, Australia"
     
     try:
@@ -18,9 +23,10 @@ def get_route():
         polygon = gdf.geometry.iloc[0]
         boundary_line = polygon.boundary
         
-        # 2. FETCH GRAPH
+        # 2. FETCH GRAPH (Commercial areas removed)
         buffered_poly = polygon.buffer(0.001) 
-        cf = '["highway"~"residential|living_street|unclassified|tertiary|secondary|primary"]'
+        # Removed 'secondary' and 'primary' to strictly block commercial main strips
+        cf = '["highway"~"residential|living_street|unclassified|tertiary"]'
         G = ox.graph_from_polygon(buffered_poly, network_type='walk', custom_filter=cf, simplify=True)
         
         # 3. CLEAN GRAPH
@@ -50,13 +56,21 @@ def get_route():
                 G_route.add_edge(u, v, **data) 
                 G_route.add_edge(u, v, **data) 
                 
-        # 5. EULERIZE
+        # 5. EULERIZE & DYNAMIC START POINT
         G_euler = nx.eulerize(G_route)
-        circuit = list(nx.eulerian_circuit(G_euler))
         
-        # 6. CONTINUOUS SEQUENTIAL SHIFT (Fixes spikes and disconnects)
+        # Determine where the route should begin
+        if start_lat and start_lng:
+            # Find the node closest to the user's GPS coordinates
+            source_node = ox.distance.nearest_nodes(G_clean, float(start_lng), float(start_lat))
+            circuit = list(nx.eulerian_circuit(G_euler, source=source_node))
+        else:
+            # Default behavior if no GPS is provided
+            circuit = list(nx.eulerian_circuit(G_euler))
+        
+        # 6. CONTINUOUS SEQUENTIAL SHIFT (Stable double-sided sidewalks)
         route_coords = []
-        OFFSET = 0.000025  # ~2.5 meter shift to the right shoulder
+        OFFSET = 0.000025  
         
         for u, v in circuit:
             edge_data = G_clean.get_edge_data(u, v)
@@ -66,14 +80,12 @@ def get_route():
             
             coords = list(geom.coords)
             
-            # Make sure we are walking the correct direction (u -> v)
             node_u_coords = (G_clean.nodes[u]['x'], G_clean.nodes[u]['y'])
             start_point = coords[0]
             dist_to_start = (start_point[0] - node_u_coords[0])**2 + (start_point[1] - node_u_coords[1])**2
             if dist_to_start > 1e-10:
                 coords.reverse()
 
-            # Shift this specific street segment to the right
             for i in range(len(coords) - 1):
                 x1, y1 = coords[i]
                 x2, y2 = coords[i+1]
@@ -91,8 +103,6 @@ def get_route():
                 off_x = nx_vec * OFFSET
                 off_y = ny_vec * OFFSET
                 
-                # Because we append sequentially to one master list, Android will 
-                # naturally draw a straight line connecting intersections.
                 if i == 0:
                     route_coords.append({"lat": y1 + off_y, "lng": x1 + off_x})
                 route_coords.append({"lat": y2 + off_y, "lng": x2 + off_x})
