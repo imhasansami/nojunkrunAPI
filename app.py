@@ -1,7 +1,7 @@
 import osmnx as ox
 import networkx as nx
 from flask import Flask, request, jsonify, Response
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString
 import traceback
 import math
 
@@ -20,7 +20,7 @@ def get_route():
         
         # 2. FETCH GRAPH
         buffered_poly = polygon.buffer(0.001) 
-        cf = '["highway"~"residential|living_street|unclassified|tertiary"]'
+        cf = '["highway"~"residential|living_street|unclassified|tertiary|secondary|primary"]'
         G = ox.graph_from_polygon(buffered_poly, network_type='walk', custom_filter=cf, simplify=True)
         
         # 3. CLEAN GRAPH
@@ -28,8 +28,9 @@ def get_route():
         largest_cc = max(nx.connected_components(G_un), key=len)
         G_clean = G_un.subgraph(largest_cc).copy()
 
-        # 4. BUILD ROUTING GRAPH
+        # 4. MASTER ROUTING GRAPH
         G_route = nx.MultiGraph()
+        
         for u, v, key, data in G_clean.edges(keys=True, data=True):
             if 'geometry' in data:
                 geom = data['geometry']
@@ -38,7 +39,8 @@ def get_route():
                                    (G_clean.nodes[v]['x'], G_clean.nodes[v]['y'])])
                 data['geometry'] = geom
 
-            is_boundary = geom.distance(boundary_line) < 0.0004 
+            is_boundary = geom.distance(boundary_line) < 0.0006 
+            
             G_route.add_node(u, x=G_clean.nodes[u]['x'], y=G_clean.nodes[u]['y'])
             G_route.add_node(v, x=G_clean.nodes[v]['x'], y=G_clean.nodes[v]['y'])
             
@@ -52,87 +54,48 @@ def get_route():
         G_euler = nx.eulerize(G_route)
         circuit = list(nx.eulerian_circuit(G_euler))
         
-        # 6. CONTINUOUS MITER SHIFT WITH ROUNDABOUT DAMPENER
-        raw_continuous_coords = []
+        # 6. CONTINUOUS SEQUENTIAL SHIFT (Fixes spikes and disconnects)
+        route_coords = []
+        OFFSET = 0.000025  # ~2.5 meter shift to the right shoulder
+        
         for u, v in circuit:
             edge_data = G_clean.get_edge_data(u, v)
             if not edge_data:
                 edge_data = G_clean.get_edge_data(v, u)
             geom = edge_data[0]['geometry']
+            
             coords = list(geom.coords)
             
-            start_point = coords[0]
+            # Make sure we are walking the correct direction (u -> v)
             node_u_coords = (G_clean.nodes[u]['x'], G_clean.nodes[u]['y'])
-            
+            start_point = coords[0]
             dist_to_start = (start_point[0] - node_u_coords[0])**2 + (start_point[1] - node_u_coords[1])**2
-            dist_to_end = (coords[-1][0] - node_u_coords[0])**2 + (coords[-1][1] - node_u_coords[1])**2
-            if dist_to_end < dist_to_start:
+            if dist_to_start > 1e-10:
                 coords.reverse()
 
-            if not raw_continuous_coords:
-                raw_continuous_coords.extend(coords)
-            else:
-                raw_continuous_coords.extend(coords[1:])
-
-        route_coords = []
-        base_offset = 0.00003  # ~3 meter shift
-        num_points = len(raw_continuous_coords)
-
-        for i in range(num_points):
-            curr = raw_continuous_coords[i]
-            
-            if i == 0:
-                nxt = raw_continuous_coords[i+1]
-                dx, dy = nxt[0] - curr[0], nxt[1] - curr[1]
-                L = math.hypot(dx, dy) or 1
-                route_coords.append({"lat": curr[1] + (dy/L)*base_offset, "lng": curr[0] + (-dx/L)*base_offset})
-                continue
-            elif i == num_points - 1:
-                prev = raw_continuous_coords[i-1]
-                dx, dy = curr[0] - prev[0], curr[1] - prev[1]
-                L = math.hypot(dx, dy) or 1
-                route_coords.append({"lat": curr[1] + (dy/L)*base_offset, "lng": curr[0] + (-dx/L)*base_offset})
-                continue
-
-            prev = raw_continuous_coords[i-1]
-            nxt = raw_continuous_coords[i+1]
-            
-            dx1, dy1 = curr[0] - prev[0], curr[1] - prev[1]
-            dx2, dy2 = nxt[0] - curr[0], nxt[1] - curr[1]
-            
-            L1 = math.hypot(dx1, dy1) or 1
-            L2 = math.hypot(dx2, dy2) or 1
-            
-            ux1, uy1 = dx1/L1, dy1/L1
-            ux2, uy2 = dx2/L2, dy2/L2
-            
-            nx1, ny1 = uy1, -ux1
-            nx2, ny2 = uy2, -ux2
-            
-            nx_avg = nx1 + nx2
-            ny_avg = ny1 + ny2
-            L_avg = math.hypot(nx_avg, ny_avg)
-            
-            # THE FIX: Roundabout & Sharp Turn Dampener
-            # If the segment is very short (< ~15 meters), reduce the offset to prevent overlap
-            min_len = min(L1, L2)
-            current_offset = base_offset
-            if min_len < 0.00015:
-                current_offset = base_offset * (min_len / 0.00015)
-            
-            if L_avg < 0.1: # 180 U-turn safe fallback
-                off_x, off_y = nx1 * current_offset, ny1 * current_offset
-            else:
-                nx_avg /= L_avg
-                ny_avg /= L_avg
-                dot = max(-1.0, min(1.0, ux1*ux2 + uy1*uy2))
-                cos_half_theta = math.sqrt((1.0 + dot) / 2.0)
+            # Shift this specific street segment to the right
+            for i in range(len(coords) - 1):
+                x1, y1 = coords[i]
+                x2, y2 = coords[i+1]
                 
-                # THE FIX: Cap the spike factor at 1.5x (stops corners from shooting out)
-                factor = current_offset / max(cos_half_theta, 0.6)
-                off_x, off_y = nx_avg * factor, ny_avg * factor
+                dx = x2 - x1
+                dy = y2 - y1
+                length = math.hypot(dx, dy)
                 
-            route_coords.append({"lat": curr[1] + off_y, "lng": curr[0] + off_x})
+                if length == 0:
+                    continue
+                    
+                nx_vec = dy / length
+                ny_vec = -dx / length
+                
+                off_x = nx_vec * OFFSET
+                off_y = ny_vec * OFFSET
+                
+                # Because we append sequentially to one master list, Android will 
+                # naturally draw a straight line connecting intersections.
+                if i == 0:
+                    route_coords.append({"lat": y1 + off_y, "lng": x1 + off_x})
+                route_coords.append({"lat": y2 + off_y, "lng": x2 + off_x})
 
         # 7. EXPORT LOGIC
         format_type = request.args.get('format', 'json')
